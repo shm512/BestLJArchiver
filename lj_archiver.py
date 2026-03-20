@@ -224,23 +224,49 @@ def _norm_comment(r):
 
 # ─── Картинки ───────────────────────────────────────────────────────────────
 
+def _collect_image_urls(html):
+    """Собирает URL картинок: и <img src>, и <a href> обёртки (полный размер)."""
+    urls = set()
+    if not html:
+        return urls
+
+    IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
+
+    # 1. Все <img src="...">
+    for m in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        if m.startswith("http"):
+            urls.add(m)
+
+    # 2. <a href="..."> где href похож на картинку (обёртка для полного размера)
+    for m in re.findall(r'<a[^>]+href=["\']([^"\']+)["\']', html, re.I):
+        if not m.startswith("http"):
+            continue
+        low = m.lower().split("?")[0]  # убираем query string
+        # Явное расширение картинки
+        if any(low.endswith(ext) for ext in IMG_EXTS):
+            urls.add(m)
+            continue
+        # Известные фото-хостинги ЖЖ
+        if any(host in low for host in ("ic.pics.livejournal", "img-fotki.yandex", "foto.my.mail.ru",
+                                         "l-files.livejournal", "pics.livejournal")):
+            urls.add(m)
+
+    return urls
+
+
 def download_images_for_post(http, post, post_dir):
-    """Скачивает все картинки поста и комментариев в папку поста."""
+    """Скачивает все картинки поста и комментариев в папку поста.
+    Ловит и превьюшки (<img src>), и полноразмерные (<a href> обёртки)."""
     os.makedirs(post_dir, exist_ok=True)
     cache = {}
 
-    # Собираем все URL
-    urls = set()
-    for m in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', post.get("body", ""), re.I):
-        if m.startswith("http"):
-            urls.add(m)
+    # Собираем все URL из поста и комментариев
+    urls = _collect_image_urls(post.get("body", ""))
     for c in post.get("comments", []):
         # TODO: аватарки комментаторов — тысячи дубликатов.
         # Нужен глобальный кэш (username → файл), не per-post.
         # Пока пропускаем, отображаем только никнеймы.
-        for m in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', c.get("body", ""), re.I):
-            if m.startswith("http"):
-                urls.add(m)
+        urls |= _collect_image_urls(c.get("body", ""))
 
     if not urls:
         return cache
@@ -385,7 +411,7 @@ def _gen_comment_css(max_depth):
     """Генерирует CSS-классы .c0 ... .cN с нелинейными отступами."""
     if max_depth <= 0:
         return ""
-    base = min(700 / max(max_depth, 1), 50)
+    base = min(1200 / max(max_depth, 1), 80)
     decay = 1.0 / max(max_depth * 0.4, 1)
     rules = []
     total = 0
@@ -561,6 +587,100 @@ def generate_post_html(post, journal, post_dir, prev_p=None, next_p=None):
         f.write(page_wrap(post.get("subject") or "(без темы)", body, journal, css_path="../../style.css"))
 
 
+# ─── XML экспорт ────────────────────────────────────────────────────────────
+
+def _xml_escape(text):
+    """Экранирует спецсимволы для XML."""
+    if not text:
+        return ""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;"))
+
+
+def _comment_to_xml(comment, indent="      "):
+    """Один комментарий → XML."""
+    i = indent
+    lines = [f'{i}<comment id="{comment.get("dtalkid", 0)}" parent="{comment.get("parent_dtalkid", 0)}" level="{comment.get("level", 0)}">']
+    lines.append(f'{i}  <author>{_xml_escape(comment.get("username", ""))}</author>')
+    lines.append(f'{i}  <date ts="{comment.get("date_ts", 0)}">{_xml_escape(comment.get("date", ""))}</date>')
+    if comment.get("subject"):
+        lines.append(f'{i}  <subject>{_xml_escape(comment["subject"])}</subject>')
+    if comment.get("deleted"):
+        lines.append(f'{i}  <deleted>true</deleted>')
+    elif comment.get("screened"):
+        lines.append(f'{i}  <screened>true</screened>')
+    else:
+        lines.append(f'{i}  <body><![CDATA[{comment.get("body", "")}]]></body>')
+    lines.append(f'{i}</comment>')
+    return "\n".join(lines)
+
+
+def export_xml(posts, journal, outdir):
+    """Экспортирует архив в XML для импорта на другие платформы."""
+    xml_path = os.path.join(outdir, f"{journal}.xml")
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<journal name="{_xml_escape(journal)}" exported="{datetime.now().isoformat()}" version="3.0">',
+        f'  <meta>',
+        f'    <url>https://{journal}.livejournal.com</url>',
+        f'    <posts_count>{len(posts)}</posts_count>',
+        f'    <comments_count>{sum(len(p.get("comments", [])) for p in posts)}</comments_count>',
+        f'  </meta>',
+        f'  <posts>',
+    ]
+
+    for post in posts:
+        did = post.get("ditemid", 0)
+        comments = post.get("comments", [])
+
+        lines.append(f'    <post id="{did}">')
+        lines.append(f'      <url>{_xml_escape(post.get("url", ""))}</url>')
+        lines.append(f'      <title>{_xml_escape(post.get("subject", ""))}</title>')
+        lines.append(f'      <date>{_xml_escape(post.get("date", ""))}</date>')
+        lines.append(f'      <security>{_xml_escape(post.get("security", "public"))}</security>')
+
+        if post.get("tags"):
+            lines.append(f'      <tags>')
+            for tag in post["tags"]:
+                lines.append(f'        <tag>{_xml_escape(tag)}</tag>')
+            lines.append(f'      </tags>')
+
+        if post.get("mood"):
+            lines.append(f'      <mood>{_xml_escape(post["mood"])}</mood>')
+        if post.get("music"):
+            lines.append(f'      <music>{_xml_escape(post["music"])}</music>')
+
+        lines.append(f'      <body><![CDATA[{post.get("body", "")}]]></body>')
+
+        if comments:
+            # Плоский список, порядок по date_ts, дерево восстанавливается по parent
+            sorted_comments = sorted(
+                [c for c in comments if isinstance(c, dict)],
+                key=lambda c: c.get("date_ts", 0),
+            )
+            lines.append(f'      <comments count="{len(sorted_comments)}">')
+            for c in sorted_comments:
+                lines.append(_comment_to_xml(c))
+            lines.append(f'      </comments>')
+
+        lines.append(f'    </post>')
+
+    lines.append(f'  </posts>')
+    lines.append(f'</journal>')
+
+    xml_text = "\n".join(lines)
+    with open(xml_path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
+
+    print(f"  📄 XML: {xml_path} ({len(xml_text) // 1024}KB)")
+    return xml_path
+
+
 # ─── Главный процесс ────────────────────────────────────────────────────────
 
 def main():
@@ -581,6 +701,7 @@ def main():
     p.add_argument("--no-images", action="store_true", help="Не скачивать картинки")
     p.add_argument("--no-comments", action="store_true", help="Не скачивать комментарии")
     p.add_argument("--id", dest="post_ids", default=None, help="Конкретные ditemid через запятую")
+    p.add_argument("--xml", action="store_true", help="Экспорт в XML для импорта на другие платформы")
     args = p.parse_args()
 
     journal = args.journal.lower().strip()
@@ -708,6 +829,10 @@ def main():
         for c in post.get("comments", []):
             c["body"] = process_lj(c.get("body", ""))
 
+        # 2e. HTML сразу на диск (без prev/next — добавим в конце)
+        generate_post_html(post, journal, post_dir)
+        print(f"    ✅ HTML сохранён")
+
         post["_done"] = True
         post["_img_count"] = img_count
         posts[did_str] = post
@@ -719,30 +844,31 @@ def main():
                 json.dump(state, f)
             print(f"    💾 Состояние сохранено")
 
-    # 3. Генерация HTML
-    print(f"\n🌐 Генерирую HTML...")
+    # 3. Финальный проход: перегенерация с prev/next + index
+    print(f"\n🌐 Обновляю навигацию и индекс...")
 
-    # Собираем посты в порядке ids (новые → старые)
     ordered_posts = [posts[did_str] for did_str in ids if did_str in posts]
-
-    # Добавляем date если нет (из Atom или из порядка)
     for p in ordered_posts:
         if not p.get("date"):
             p["date"] = ""
 
-    generate_index(ordered_posts, journal, outdir)
-
     for i, post in enumerate(ordered_posts):
         did = post["ditemid"]
         post_dir = os.path.join(outdir, "posts", str(did))
-        os.makedirs(post_dir, exist_ok=True)
         prev_p = ordered_posts[i - 1] if i > 0 else None
         next_p = ordered_posts[i + 1] if i < len(ordered_posts) - 1 else None
         generate_post_html(post, journal, post_dir, prev_p, next_p)
 
+    generate_index(ordered_posts, journal, outdir)
+
     # Cleanup state
     if os.path.exists(state_file):
         os.remove(state_file)
+
+    # 4. XML экспорт
+    if args.xml:
+        print(f"\n📄 Экспорт в XML...")
+        export_xml(ordered_posts, journal, outdir)
 
     # Итоги
     filled = sum(1 for p in ordered_posts if p.get("body"))

@@ -107,6 +107,50 @@ archive/varandej/
 
 Пауза между запросами (по умолчанию 1 сек), автоматическая обработка 429 и 503, ретраи с exponential backoff.
 
+### Экспорт в XML
+
+Флаг `--xml` генерирует файл `journal.xml` для импорта на другие платформы:
+
+```bash
+python lj_archiver.py varandej 0-9 --xml
+```
+
+Формат:
+
+```xml
+<journal name="varandej" exported="2026-03-06T22:00" version="3.0">
+  <meta>
+    <posts_count>10</posts_count>
+    <comments_count>342</comments_count>
+  </meta>
+  <posts>
+    <post id="1260352">
+      <title>Улан-Удэ. Часть 6</title>
+      <date>2025-11-15 14:30:00</date>
+      <tags><tag>Россия</tag></tags>
+      <body><![CDATA[<p>HTML как есть</p>]]></body>
+      <comments count="12">
+        <comment id="5001" parent="0" level="1">
+          <author>historian_pavel</author>
+          <date ts="1731686400">November 15 2025</date>
+          <body><![CDATA[<p>текст</p>]]></body>
+        </comment>
+      </comments>
+    </post>
+  </posts>
+</journal>
+```
+
+Комментарии — плоский список, дерево восстанавливается по атрибуту `parent`. HTML тела в CDATA. Удалённые и скрытые комментарии помечены `<deleted>` / `<screened>`. Timestamp в атрибуте `ts`.
+
+### Тесты
+
+```bash
+python test_xml_export.py
+```
+
+37 тестов покрывают: структуру XML, счётчики, спецсимволы, кириллицу, пустой журнал, удалённые/скрытые/анонимные комментарии, глубокие ветки, CDATA, теги, parent-цепочки.
+
 ---
 
 ## 🇬🇧 English
@@ -207,6 +251,126 @@ State is saved every 5 posts to `.state.json`. Interrupted → run again → pic
 ### Rate limits
 
 Delay between requests (default 1 sec), automatic 429 and 503 handling, retries with exponential backoff.
+
+### XML export
+
+The `--xml` flag generates a `journal.xml` file for importing into other platforms:
+
+```bash
+python lj_archiver.py varandej 0-9 --xml
+```
+
+Format:
+
+```xml
+<journal name="varandej" exported="2026-03-06T22:00" version="3.0">
+  <meta>
+    <posts_count>10</posts_count>
+    <comments_count>342</comments_count>
+  </meta>
+  <posts>
+    <post id="1260352">
+      <title>Ulan-Ude. Part 6</title>
+      <date>2025-11-15 14:30:00</date>
+      <tags><tag>Russia</tag></tags>
+      <body><![CDATA[<p>HTML preserved as-is</p>]]></body>
+      <comments count="12">
+        <comment id="5001" parent="0" level="1">
+          <author>historian_pavel</author>
+          <date ts="1731686400">November 15 2025</date>
+          <body><![CDATA[<p>text</p>]]></body>
+        </comment>
+      </comments>
+    </post>
+  </posts>
+</journal>
+```
+
+Comments are a flat list; tree is reconstructed via `parent` attribute. HTML body in CDATA. Deleted and screened comments marked with `<deleted>` / `<screened>`. Unix timestamp in `ts` attribute.
+
+### Tests
+
+```bash
+python test_xml_export.py
+```
+
+37 tests covering: XML structure, counters, special characters, Cyrillic, empty journal, deleted/screened/anonymous comments, deep threads, CDATA, tags, parent chains.
+
+---
+
+### MCP сервер
+
+LJ Archiver можно использовать как MCP-сервер — AI-ассистенты (Claude, etc.) смогут архивировать ЖЖ через инструменты.
+
+Установка:
+```bash
+pip install "mcp[cli]" requests lxml beautifulsoup4
+```
+
+Запуск:
+```bash
+python lj_mcp_server.py                   # stdio (Claude Code)
+mcp dev lj_mcp_server.py                  # MCP Inspector (отладка)
+```
+
+Подключение в Claude Desktop (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "livejournal": {
+      "command": "python",
+      "args": ["/path/to/lj_mcp_server.py"]
+    }
+  }
+}
+```
+
+Инструменты:
+
+| Инструмент | Описание |
+|---|---|
+| `lj_list_posts` | Список постов журнала (ID, URL) |
+| `lj_get_post` | Контент поста + превью комментариев |
+| `lj_archive_posts` | Полная архивация: контент, комментарии, картинки, HTML |
+| `lj_export_xml` | Экспорт скачанного архива в XML |
+| `lj_search_archive` | Полнотекстовый поиск по скачанному архиву |
+
+### MCP server
+
+LJ Archiver works as an MCP server — AI assistants (Claude, etc.) can archive LJ through tools.
+
+Setup:
+```bash
+pip install "mcp[cli]" requests lxml beautifulsoup4
+```
+
+Run:
+```bash
+python lj_mcp_server.py                   # stdio (Claude Code)
+mcp dev lj_mcp_server.py                  # MCP Inspector (debug)
+```
+
+Connect in Claude Desktop (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "livejournal": {
+      "command": "python",
+      "args": ["/path/to/lj_mcp_server.py"]
+    }
+  }
+}
+```
+
+Tools:
+
+| Tool | Description |
+|---|---|
+| `lj_list_posts` | List journal posts (ID, URL) |
+| `lj_get_post` | Post content + comment preview |
+| `lj_archive_posts` | Full archive: content, comments, images, HTML |
+| `lj_export_xml` | Export downloaded archive to XML |
+| `lj_search_archive` | Full-text search over downloaded archive |
 
 ---
 
