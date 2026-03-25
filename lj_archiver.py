@@ -82,8 +82,25 @@ class HTTP:
 # ─── Сбор ID постов ────────────────────────────────────────────────────────
 
 def collect_post_ids(http, journal, max_count=None):
-    """Собирает ditemid через HTML-пагинацию главной страницы."""
+    """Собирает ditemid. Приоритет: sitemap.xml (полный), HTML-пагинация (fallback)."""
     print(f"\n📝 Собираю ID постов {journal}...")
+
+    # ── Способ 1: sitemap.xml (содержит ВСЕ посты) ──
+    sitemap = http.get(f"https://{journal}.livejournal.com/sitemap.xml")
+    if sitemap and len(sitemap) > 1000:
+        ids = re.findall(
+            rf'https://{re.escape(journal)}\.livejournal\.com/(\d+)\.html',
+            sitemap,
+        )
+        unique = sorted(set(ids), key=lambda x: int(x), reverse=True)
+        if unique:
+            if max_count:
+                unique = unique[:max_count]
+            print(f"  📋 sitemap.xml: {len(unique)} постов (новые → старые)")
+            return unique
+
+    # ── Способ 2: HTML-пагинация (лимит ~500 постов) ──
+    print(f"  ⚠️  sitemap.xml недоступен, использую HTML-пагинацию...")
     all_ids = []
     skip = 0
     while True:
@@ -108,7 +125,7 @@ def collect_post_ids(http, journal, max_count=None):
         if f"skip={skip + 10}" not in html:
             break
         skip += 10
-    # Сортируем: больший ditemid = новее
+
     all_ids = sorted(set(all_ids), key=lambda x: int(x), reverse=True)
     if max_count:
         all_ids = all_ids[:max_count]
@@ -681,6 +698,142 @@ def export_xml(posts, journal, outdir):
     return xml_path
 
 
+# ─── MCP-сервер (lazy import) ────────────────────────────────────────────────
+
+DEFAULT_ARCHIVE_DIR = "./archive"
+
+def run_mcp_server():
+    """Запускает MCP-сервер для AI-ассистентов (Claude и др.)."""
+    try:
+        from mcp.server.fastmcp import FastMCP
+        from pydantic import BaseModel, Field, ConfigDict
+    except ImportError:
+        print("❌ Для MCP-режима нужен пакет mcp:")
+        print("   pip install 'mcp[cli]'")
+        sys.exit(1)
+
+    from typing import Optional
+
+    mcp = FastMCP("livejournal_mcp")
+
+    class ListPostsInput(BaseModel):
+        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+        journal: str = Field(..., description="Имя журнала ЖЖ", min_length=1, max_length=50)
+        count: int = Field(default=20, description="Сколько постов (новые первые)", ge=1, le=10000)
+
+    class GetPostInput(BaseModel):
+        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+        journal: str = Field(..., description="Имя журнала ЖЖ", min_length=1, max_length=50)
+        ditemid: int = Field(..., description="ID поста (ditemid)")
+        include_comments: bool = Field(default=True, description="Загрузить комментарии")
+
+    class ArchiveInput(BaseModel):
+        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+        journal: str = Field(..., description="Имя журнала ЖЖ", min_length=1, max_length=50)
+        range_start: int = Field(default=0, description="Начало диапазона (0 = самый свежий)", ge=0)
+        range_end: int = Field(default=9, description="Конец диапазона включительно", ge=0)
+        post_ids: Optional[str] = Field(default=None, description="ditemid через запятую (вместо диапазона)")
+        download_images: bool = Field(default=True, description="Скачивать картинки")
+        download_comments: bool = Field(default=True, description="Скачивать комментарии")
+        output_dir: str = Field(default=DEFAULT_ARCHIVE_DIR, description="Папка для архива")
+
+    class SearchInput(BaseModel):
+        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+        journal: str = Field(..., description="Имя журнала", min_length=1, max_length=50)
+        query: str = Field(..., description="Текст для поиска", min_length=1)
+        output_dir: str = Field(default=DEFAULT_ARCHIVE_DIR, description="Папка архива")
+
+    @mcp.tool(name="lj_list_posts", annotations={"readOnlyHint": True, "openWorldHint": True})
+    async def lj_list_posts(params: ListPostsInput) -> str:
+        """Список постов журнала ЖЖ (ID и URL), отсортированных от новых к старым."""
+        http = HTTP(delay=1.0)
+        ids = collect_post_ids(http, params.journal, max_count=params.count)
+        posts = [{"ditemid": int(d), "url": f"https://{params.journal}.livejournal.com/{d}.html"} for d in ids]
+        return json.dumps({"journal": params.journal, "count": len(posts), "posts": posts}, ensure_ascii=False, indent=2)
+
+    @mcp.tool(name="lj_get_post", annotations={"readOnlyHint": True, "openWorldHint": True})
+    async def lj_get_post(params: GetPostInput) -> str:
+        """Загружает пост: заголовок, тело, теги. Опционально — комментарии."""
+        http = HTTP(delay=1.0)
+        content = fetch_post_content(http, params.journal, params.ditemid)
+        if not content:
+            return f"Ошибка: пост {params.ditemid} не найден."
+        result = {"ditemid": params.ditemid, "subject": content.get("subject", ""),
+                  "body_preview": re.sub(r"<[^>]+>", "", content.get("body", ""))[:500],
+                  "tags": content.get("tags", []),
+                  "images": len(re.findall(r"<img", content.get("body", ""), re.I))}
+        if params.include_comments:
+            comments = fetch_comments(http, params.journal, params.ditemid)
+            result["comments_count"] = len(comments)
+            result["comments_preview"] = [
+                {"id": c["dtalkid"], "author": c.get("username", ""),
+                 "preview": re.sub(r"<[^>]+>", "", c.get("body", ""))[:100]}
+                for c in comments[:20]
+            ]
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @mcp.tool(name="lj_archive_posts", annotations={"readOnlyHint": False, "openWorldHint": True})
+    async def lj_archive_posts(params: ArchiveInput) -> str:
+        """Полная архивация: контент, комментарии, картинки → офлайн-HTML."""
+        journal = params.journal.lower().strip()
+        outdir = os.path.join(params.output_dir, journal)
+        os.makedirs(outdir, exist_ok=True)
+        http = HTTP(delay=1.0)
+        if params.post_ids:
+            ids = [i.strip() for i in params.post_ids.split(",")]
+        else:
+            all_ids = collect_post_ids(http, journal, max_count=params.range_end + 1)
+            ids = all_ids[params.range_start:params.range_end + 1]
+        posts, tc, ti = {}, 0, 0
+        for did_str in ids:
+            did = int(did_str)
+            post_dir = os.path.join(outdir, "posts", did_str)
+            os.makedirs(post_dir, exist_ok=True)
+            content = fetch_post_content(http, journal, did)
+            post = {"ditemid": did, "itemid": did // 256, "anum": did % 256,
+                    "url": f"https://{journal}.livejournal.com/{did}.html",
+                    "security": "public", "mood": "", "music": "",
+                    "comments": [], "comments_count": 0,
+                    **(content or {"subject": "", "body": "", "date": "", "tags": []})}
+            if params.download_comments:
+                c = fetch_comments(http, journal, did); post["comments"] = c; tc += len(c)
+            if params.download_images:
+                cache = download_images_for_post(http, post, post_dir)
+                apply_image_cache(post, cache); ti += len(cache)
+            post["body"] = process_lj(post.get("body", ""))
+            for c in post.get("comments", []): c["body"] = process_lj(c.get("body", ""))
+            generate_post_html(post, journal, post_dir)
+            posts[did_str] = post
+        ordered = [posts[d] for d in ids if d in posts]
+        generate_index(ordered, journal, outdir)
+        return json.dumps({"status": "ok", "posts": len(ordered), "comments": tc,
+                           "images": ti, "path": os.path.abspath(outdir)}, ensure_ascii=False, indent=2)
+
+    @mcp.tool(name="lj_search_archive", annotations={"readOnlyHint": True, "openWorldHint": False})
+    async def lj_search_archive(params: SearchInput) -> str:
+        """Полнотекстовый поиск по скачанному архиву."""
+        posts_dir = os.path.join(params.output_dir, params.journal.lower(), "posts")
+        if not os.path.isdir(posts_dir):
+            return f"Архив {params.journal} не найден."
+        results = []
+        for folder in sorted(os.listdir(posts_dir), reverse=True):
+            hp = os.path.join(posts_dir, folder, f"{folder}.html")
+            if not os.path.isfile(hp): continue
+            with open(hp, "r", encoding="utf-8") as f: html = f.read()
+            text = re.sub(r"<[^>]+>", " ", html)
+            idx = text.lower().find(params.query.lower())
+            if idx < 0: continue
+            ctx = text[max(0, idx - 80):idx + len(params.query) + 80].strip()
+            soup = BeautifulSoup(html, "lxml")
+            title_el = soup.select_one("h1.post-title")
+            results.append({"ditemid": int(folder), "title": title_el.get_text(strip=True) if title_el else "",
+                            "context": f"...{ctx}..."})
+        return json.dumps({"query": params.query, "count": len(results), "results": results}, ensure_ascii=False, indent=2)
+
+    print("🔌 MCP-сервер запущен (stdio)")
+    mcp.run(transport="stdio")
+
+
 # ─── Главный процесс ────────────────────────────────────────────────────────
 
 def main():
@@ -692,9 +845,10 @@ def main():
                "  python lj_archiver.py varandej 0-99\n"
                "  python lj_archiver.py varandej 0-9 --no-images\n"
                "  python lj_archiver.py varandej --id 1260352\n"
-               "  python lj_archiver.py varandej --id 1260352,1253754,909694\n",
+               "  python lj_archiver.py varandej --id 1260352,1253754,909694\n"
+               "  python lj_archiver.py --mcp\n",
     )
-    p.add_argument("journal", help="Имя журнала")
+    p.add_argument("journal", nargs="?", default=None, help="Имя журнала")
     p.add_argument("range", nargs="?", default=None, help="Диапазон постов, напр. 0-99 (новые→старые)")
     p.add_argument("-o", "--output-dir", default="./archive")
     p.add_argument("-d", "--delay", type=float, default=1.0, help="Задержка между запросами (сек)")
@@ -702,7 +856,16 @@ def main():
     p.add_argument("--no-comments", action="store_true", help="Не скачивать комментарии")
     p.add_argument("--id", dest="post_ids", default=None, help="Конкретные ditemid через запятую")
     p.add_argument("--xml", action="store_true", help="Экспорт в XML для импорта на другие платформы")
+    p.add_argument("--mcp", action="store_true", help="Запустить как MCP-сервер (stdio)")
     args = p.parse_args()
+
+    # MCP-режим
+    if args.mcp:
+        run_mcp_server()
+        return
+
+    if not args.journal:
+        p.error("укажите имя журнала (или --mcp для MCP-сервера)")
 
     journal = args.journal.lower().strip()
     outdir = os.path.join(args.output_dir, journal)

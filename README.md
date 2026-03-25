@@ -300,7 +300,7 @@ python test_xml_export.py
 
 ### MCP сервер
 
-LJ Archiver можно использовать как MCP-сервер — AI-ассистенты (Claude, etc.) смогут архивировать ЖЖ через инструменты.
+LJ Archiver можно запустить как MCP-сервер — AI-ассистенты (Claude, etc.) смогут архивировать ЖЖ через инструменты.
 
 Установка:
 ```bash
@@ -309,8 +309,7 @@ pip install "mcp[cli]" requests lxml beautifulsoup4
 
 Запуск:
 ```bash
-python lj_mcp_server.py                   # stdio (Claude Code)
-mcp dev lj_mcp_server.py                  # MCP Inspector (отладка)
+python lj_archiver.py --mcp                # stdio (Claude Code)
 ```
 
 Подключение в Claude Desktop (`claude_desktop_config.json`):
@@ -319,7 +318,7 @@ mcp dev lj_mcp_server.py                  # MCP Inspector (отладка)
   "mcpServers": {
     "livejournal": {
       "command": "python",
-      "args": ["/path/to/lj_mcp_server.py"]
+      "args": ["/path/to/lj_archiver.py", "--mcp"]
     }
   }
 }
@@ -337,7 +336,7 @@ mcp dev lj_mcp_server.py                  # MCP Inspector (отладка)
 
 ### MCP server
 
-LJ Archiver works as an MCP server — AI assistants (Claude, etc.) can archive LJ through tools.
+LJ Archiver can run as an MCP server — AI assistants (Claude, etc.) can archive LJ through tools.
 
 Setup:
 ```bash
@@ -346,8 +345,7 @@ pip install "mcp[cli]" requests lxml beautifulsoup4
 
 Run:
 ```bash
-python lj_mcp_server.py                   # stdio (Claude Code)
-mcp dev lj_mcp_server.py                  # MCP Inspector (debug)
+python lj_archiver.py --mcp                # stdio (Claude Code)
 ```
 
 Connect in Claude Desktop (`claude_desktop_config.json`):
@@ -356,7 +354,7 @@ Connect in Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "livejournal": {
       "command": "python",
-      "args": ["/path/to/lj_mcp_server.py"]
+      "args": ["/path/to/lj_archiver.py", "--mcp"]
     }
   }
 }
