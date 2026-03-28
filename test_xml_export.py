@@ -13,7 +13,7 @@ from xml.etree import ElementTree
 
 # Добавляем путь к скрипту
 sys.path.insert(0, os.path.dirname(__file__))
-from lj_archiver import export_xml, build_tree, _xml_escape, _collect_image_urls
+from lj_archiver import export_xml, build_tree, _xml_escape, _collect_image_urls, VERSION
 
 
 # ─── Тестовые данные (имитация реального журнала) ───────────────────────────
@@ -248,7 +248,7 @@ class TestXmlExport(unittest.TestCase):
         root = self._export_and_parse()
         self.assertEqual(root.attrib["name"], MOCK_JOURNAL)
         self.assertIn("exported", root.attrib)
-        self.assertEqual(root.attrib["version"], "3.0")
+        self.assertEqual(root.attrib["version"], VERSION)
 
     def test_meta(self):
         """Блок <meta> с правильными счётчиками."""

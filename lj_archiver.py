@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LJ Archiver v3.0 — Лучший архиватор LiveJournal.
+LJ Archiver — Лучший архиватор LiveJournal.
 
 Структура:
   archive/username/
@@ -39,8 +39,9 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 
-UA = "LJArchiver/3.0 (best LJ archiver; respectful bot)"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 MAX_RETRIES = 3
+VERSION = "3.2.0"
 
 # ─── HTTP ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,8 @@ class HTTP:
         self.s.headers.update({"User-Agent": UA})
         self.delay = delay
         self._t = 0
+        self.host_status = {}  # глобальный кэш между постами: host → "alive"/"dead"
+        self._img_wait_total = 0  # глобальный счётчик секунд потраченных на ожидание хостов
 
     def _wait(self):
         d = time.time() - self._t
@@ -57,12 +60,14 @@ class HTTP:
             time.sleep(self.delay - d)
         self._t = time.time()
 
-    def get(self, url, binary=False):
+    def get(self, url, binary=False, timeout=30):
         for a in range(MAX_RETRIES):
             self._wait()
             try:
-                r = self.s.get(url, timeout=30)
+                r = self.s.get(url, timeout=timeout)
                 if r.status_code == 429:
+                    if binary:
+                        return None
                     time.sleep(int(r.headers.get("Retry-After", 60)))
                     continue
                 if r.status_code == 503:
@@ -77,6 +82,53 @@ class HTTP:
                     return None
                 time.sleep(2 ** a)
         return None
+
+    def probe_img_host(self, urls):
+        """Проверяет доступность хоста с backoff при 429.
+
+        Пробует до 3 разных URL с хоста (на случай если конкретный файл удалён).
+        При 429: ждём 0 → 8с → 16с → сдаёмся (~24с бюджет на хост).
+        При 404/403: файл удалён, пробуем следующий URL.
+        Глобальный лимит: 90с суммарно на все ожидания хостов.
+
+        Возвращает (data, url, status):
+          status: "alive", "dead_rate_limit", "dead_timeout", "dead_all_gone", "dead_budget"
+        """
+        IMG_WAIT_BUDGET = 90
+
+        if self._img_wait_total >= IMG_WAIT_BUDGET:
+            return None, None, "dead_budget"
+
+        samples = urls[:3]
+        backoffs = [0, 8, 16]
+
+        for attempt, wait in enumerate(backoffs):
+            if wait > 0:
+                if self._img_wait_total + wait > IMG_WAIT_BUDGET:
+                    return None, None, "dead_budget"
+                self._img_wait_total += wait
+                time.sleep(wait)
+            for sample_url in samples:
+                self._wait()
+                try:
+                    r = self.s.get(sample_url, timeout=10)
+                    if r.status_code == 200 and len(r.content) > 500:
+                        return r.content, sample_url, "alive"
+                    if r.status_code in (404, 403, 410):
+                        continue  # этот файл удалён, попробуем другой
+                    if r.status_code == 429:
+                        break  # backoff и следующая попытка
+                    if r.status_code >= 500:
+                        break
+                except requests.exceptions.Timeout:
+                    self._img_wait_total += 10  # timeout тоже считается
+                    break
+                except Exception:
+                    break
+            else:
+                return None, None, "dead_all_gone"
+
+        return None, None, "dead_rate_limit"
 
 
 # ─── Сбор ID постов ────────────────────────────────────────────────────────
@@ -187,7 +239,7 @@ def fetch_comments(http, journal, ditemid):
                 all_c[cid] = _norm_comment(c)
                 new += 1
         if total_expected > 0:
-            pct = len(all_c) * 100 // max(total_expected, 1)
+            pct = min(100, len(all_c) * 100 // max(total_expected, 1))
             print(f"\r    💬 стр.{page}: {len(all_c)}/{total_expected} ({pct}%)", end="", flush=True)
         if new == 0:
             break
@@ -273,7 +325,8 @@ def _collect_image_urls(html):
 
 def download_images_for_post(http, post, post_dir):
     """Скачивает все картинки поста и комментариев в папку поста.
-    Ловит и превьюшки (<img src>), и полноразмерные (<a href> обёртки)."""
+    Ловит и превьюшки (<img src>), и полноразмерные (<a href> обёртки).
+    Проверяет каждый хост одним пробным запросом — мёртвые пропускаются сразу."""
     os.makedirs(post_dir, exist_ok=True)
     cache = {}
 
@@ -288,19 +341,75 @@ def download_images_for_post(http, post, post_dir):
     if not urls:
         return cache
 
-    total = len(urls)
-    ok = 0
+    # ── Группируем по хостам ──
+    from collections import defaultdict
+    by_host = defaultdict(list)
+    for url in urls:
+        m = re.match(r'https?://([^/]+)', url)
+        by_host[m.group(1) if m else "unknown"].append(url)
+
+    # ── Проверяем хосты (глобальный кэш + backoff при 429) ──
+    skip_count = 0
+
+    for host, host_urls in by_host.items():
+        # Уже знаем статус с предыдущего поста
+        if host in http.host_status:
+            if http.host_status[host] == "dead":
+                skip_count += len(host_urls)
+            continue
+
+        # Уже скачан файл с этого хоста?
+        sample = host_urls[0]
+        h = hashlib.md5(sample.encode()).hexdigest()[:12]
+        ext = ".jpg"
+        for e in [".png", ".gif", ".webp", ".svg", ".jpeg"]:
+            if e in sample.lower(): ext = e; break
+        fp = os.path.join(post_dir, f"img_{h}{ext}")
+        if os.path.exists(fp) and os.path.getsize(fp) > 500:
+            http.host_status[host] = "alive"
+            continue
+
+        # Probe с backoff: 0 → 8с → 16с
+        data, probed_url, status = http.probe_img_host(host_urls)
+
+        if status == "alive":
+            http.host_status[host] = "alive"
+            with open(fp, "wb") as f:
+                f.write(data)
+            cache[probed_url] = f"img_{h}{ext}"
+        elif status == "dead_all_gone":
+            http.host_status[host] = "alive"  # хост жив, файлы удалены
+        elif status == "dead_budget":
+            http.host_status[host] = "dead"
+            skip_count += len(host_urls)
+            print(f"\n    ⏱️  {host} — глобальный лимит ожидания (90с), пропускаю {len(host_urls)} картинок", end="")
+        else:
+            http.host_status[host] = "dead"
+            skip_count += len(host_urls)
+            print(f"\n    ⛔ {host} — {status}, пропускаю {len(host_urls)} картинок", end="")
+
+    # ── Качаем с живых хостов ──
+    live_urls = []
+    for url in urls:
+        if url in cache:
+            continue
+        m = re.match(r'https?://([^/]+)', url)
+        host = m.group(1) if m else "unknown"
+        if http.host_status.get(host) != "dead":
+            live_urls.append(url)
+    skip_count = len(urls) - len(live_urls) - len(cache)
+
+    total = len(live_urls)
+    ok = len(cache)
     fail = 0
     cached = 0
     total_bytes = 0
 
-    for i, url in enumerate(urls, 1):
+    for i, url in enumerate(live_urls, 1):
         h = hashlib.md5(url.encode()).hexdigest()[:12]
         ext = ".jpg"
         for e in [".png", ".gif", ".webp", ".svg", ".jpeg"]:
-            if e in url.lower():
-                ext = e
-                break
+            if e in url.lower(): ext = e; break
         fn = f"img_{h}{ext}"
         fp = os.path.join(post_dir, fn)
 
@@ -309,7 +418,7 @@ def download_images_for_post(http, post, post_dir):
             cached += 1
             total_bytes += os.path.getsize(fp)
         else:
-            data = http.get(url, binary=True)
+            data = http.get(url, binary=True, timeout=10)
             if data and len(data) > 500:
                 with open(fp, "wb") as f:
                     f.write(data)
@@ -319,9 +428,10 @@ def download_images_for_post(http, post, post_dir):
             else:
                 fail += 1
 
-        pct = i * 100 // total
+        pct = i * 100 // max(total, 1)
         mb = total_bytes / 1024 / 1024
-        print(f"\r    🖼️  {i}/{total} ({pct}%) | {ok} new, {cached} cached, {fail} fail | {mb:.1f}MB", end="", flush=True)
+        skip_str = f", {skip_count} skip" if skip_count else ""
+        print(f"\r    🖼️  {i}/{total} ({pct}%) | {ok} new, {cached} cached, {fail} fail{skip_str} | {mb:.1f}MB", end="", flush=True)
 
     print()  # newline after progress
     return cache
@@ -468,7 +578,7 @@ def page_wrap(title, body, journal, css_path="style.css"):
 <title>{title} — {journal}</title>
 <link rel="stylesheet" href="{css_path}"></head>
 <body><div class="container">{body}</div>
-<footer>Архив: <strong>LJ Archiver v3.0</strong></footer></body></html>'''
+<footer>Архив: <strong>LJ Archiver v{VERSION}</strong></footer></body></html>'''
 
 
 def _extract_snippet(body_html, max_len=120):
@@ -642,7 +752,7 @@ def export_xml(posts, journal, outdir):
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<journal name="{_xml_escape(journal)}" exported="{datetime.now().isoformat()}" version="3.0">',
+        f'<journal name="{_xml_escape(journal)}" exported="{datetime.now().isoformat()}" version="{VERSION}">',
         f'  <meta>',
         f'    <url>https://{journal}.livejournal.com</url>',
         f'    <posts_count>{len(posts)}</posts_count>',
@@ -838,18 +948,17 @@ def run_mcp_server():
 
 def main():
     p = argparse.ArgumentParser(
-        description="LJ Archiver v3.0 — лучший архиватор LiveJournal",
+        description=f"LJ Archiver v{VERSION} — лучший архиватор LiveJournal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Примеры:\n"
-               "  python lj_archiver.py varandej\n"
-               "  python lj_archiver.py varandej 0-99\n"
-               "  python lj_archiver.py varandej 0-9 --no-images\n"
+               "  python lj_archiver.py varandej              # все посты\n"
+               "  python lj_archiver.py varandej 0-9          # первые 10\n"
+               "  python lj_archiver.py varandej 0-2,5,10-12  # выборочно\n"
                "  python lj_archiver.py varandej --id 1260352\n"
-               "  python lj_archiver.py varandej --id 1260352,1253754,909694\n"
-               "  python lj_archiver.py --mcp\n",
+               "  python lj_archiver.py varandej --mcp\n",
     )
     p.add_argument("journal", nargs="?", default=None, help="Имя журнала")
-    p.add_argument("range", nargs="?", default=None, help="Диапазон постов, напр. 0-99 (новые→старые)")
+    p.add_argument("range", nargs="?", default=None, help="Индексы: 0-9, 1-3,5-7,42, или 1024")
     p.add_argument("-o", "--output-dir", default="./archive")
     p.add_argument("-d", "--delay", type=float, default=1.0, help="Задержка между запросами (сек)")
     p.add_argument("--no-images", action="store_true", help="Не скачивать картинки")
@@ -871,12 +980,18 @@ def main():
     outdir = os.path.join(args.output_dir, journal)
     os.makedirs(outdir, exist_ok=True)
 
-    # Парсим диапазон
-    range_start, range_end = 0, None
+    # Парсим диапазон: поддержка "0-9", "1-3,5-7,1024", "42"
+    indices = None
     if args.range:
-        parts = args.range.split("-")
-        range_start = int(parts[0])
-        range_end = int(parts[1]) + 1 if len(parts) > 1 else range_start + 1
+        indices = []
+        for part in args.range.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                indices.extend(range(int(a), int(b) + 1))
+            else:
+                indices.append(int(part))
+        indices = sorted(set(indices))
 
     # Режим --id: конкретные посты
     explicit_ids = None
@@ -885,9 +1000,14 @@ def main():
 
     http = HTTP(delay=args.delay)
 
-    mode_str = f"ID: {','.join(explicit_ids)}" if explicit_ids else f"Диапазон: {range_start}-{(range_end - 1) if range_end else '∞'}"
+    if explicit_ids:
+        mode_str = f"ID: {','.join(explicit_ids)}"
+    elif indices is not None:
+        mode_str = f"Индексы: {args.range}"
+    else:
+        mode_str = "Все посты"
     print(f"{'=' * 60}")
-    print(f"  LJ Archiver v3.0")
+    print(f"  LJ Archiver v{VERSION}")
     print(f"  Журнал: {journal}")
     print(f"  {mode_str}")
     print(f"  Картинки: {'да' if not args.no_images else 'нет'}")
@@ -907,11 +1027,14 @@ def main():
         ids = explicit_ids
         print(f"\n📋 Указано вручную: {len(ids)} постов")
     else:
-        max_needed = range_end if range_end else None
+        max_needed = max(indices) + 1 if indices else None
         all_ids = state.get("all_ids") or collect_post_ids(http, journal, max_needed)
         state["all_ids"] = all_ids
-        ids = all_ids[range_start:range_end]
-        print(f"\n📋 Постов в диапазоне: {len(ids)}")
+        if indices is not None:
+            ids = [all_ids[i] for i in indices if i < len(all_ids)]
+        else:
+            ids = all_ids
+        print(f"\n📋 Постов: {len(ids)}")
 
     # 2. Загрузка контента + комментарии + картинки для каждого поста
     posts = state.get("posts", {})

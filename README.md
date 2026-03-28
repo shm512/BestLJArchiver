@@ -40,6 +40,13 @@ python lj_archiver.py varandej 0-9
 # Все посты
 python lj_archiver.py varandej
 
+# Выборочные диапазоны
+python lj_archiver.py varandej 1-3,5-7
+python lj_archiver.py varandej 0-2,5,10-12
+
+# Один конкретный по индексу
+python lj_archiver.py varandej 42
+
 # Конкретные посты по ID
 python lj_archiver.py varandej --id 1260352,1253754
 
@@ -184,6 +191,13 @@ python lj_archiver.py varandej 0-9
 
 # All posts
 python lj_archiver.py varandej
+
+# Selective ranges
+python lj_archiver.py varandej 1-3,5-7
+python lj_archiver.py varandej 0-2,5,10-12
+
+# Single post by index
+python lj_archiver.py varandej 42
 
 # Specific posts by ID
 python lj_archiver.py varandej --id 1260352,1253754
